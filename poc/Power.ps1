@@ -290,7 +290,7 @@ function Invoke-Apply([bool]$DetectOnly) {
 
     # --- Network adapters ---------------------------------------------------------------------
     $failed   = 0
-    $adapters = Get-TargetAdapter
+    $adapters = @(Get-TargetAdapter)
     if (-not $adapters.Count) { Write-Log WARN "No $(if ($AllAdapters) { 'physical' } else { 'connected physical' }) network adapters found" }
     foreach ($a in $adapters) {
         $guid = "$($a.InterfaceGuid)".ToLower()
