@@ -16,16 +16,18 @@
         - Networking connectivity in standby   -> Enabled    (Modern Standby PCs only)
         - Lid close action (plugged in only)   -> Do nothing (IgnoreLidOnAC)
 
-      Network adapters (physical, not Bluetooth; connected ones only unless AllAdapters)
-        - Every driver (advanced) setting is listed with its value and options, so the job
-          output shows what the driver offers.
+      Network adapters (physical, not Bluetooth; connected or not, unless ConnectedOnly)
+        - Every driver setting on the Advanced tab is listed with its value and options, so the
+          job output shows what the driver offers.
         - Every power-saving driver setting is set to its Off/Disabled value: found by keyword
           (*EEE, AdvancedEEE, EnableGreenEthernet, GigaLite, PowerSavingMode, ULPMode, ...) or by
           name (Energy Efficient, EEE, Green, Power Saving, Low Power, Power Down, Idle Power,
-          Selective Suspend, Gigabit Lite, Battery Saver, U-APSD, ...). Wake-on-LAN / PME settings
+          Selective Suspend, Gigabit Lite, Battery Saver, U-APSD, Packet Coalescing, ...). Wake-on-LAN / PME settings
           are never touched. Wi-Fi MIMO Power Save Mode -> No SMPS; Transmit Power -> Highest.
-        - "Allow the computer to turn off this device to save power" -> off (set through
-          WMI root\wmi MSPower_DeviceEnable; Set-NetAdapterPowerManagement can't set it)
+        - "Allow the computer to turn off this device to save power" -> off. Set through WMI
+          (root\wmi MSPower_DeviceEnable) when the driver offers it there, otherwise through the
+          adapter's PnPCapabilities registry value (24; applies after an adapter restart or
+          reboot). Set-NetAdapterPowerManagement can't set it.
         - Selective suspend / sleep on disconnect (power management tab) -> off
         Each change is made on its own: one the driver refuses is logged and the rest still apply.
 
@@ -56,9 +58,10 @@
     Closing the lid while plugged in does nothing instead of sleeping. Default on.
     Component variable: IgnoreLidOnAC ("true"/"false").
 
-.PARAMETER AllAdapters
-    Also change physical adapters that aren't connected now (e.g. the dock's Ethernet).
-    Default off: connected adapters only. Component variable: AllAdapters ("true"/"false").
+.PARAMETER ConnectedOnly
+    Change only adapters that are connected now. Default off: every physical adapter, so the
+    Ethernet port is ready when the PC is moved to a cable. Component variable: ConnectedOnly
+    ("true"/"false").
 
 .PARAMETER RestartAdapter
     Restart each adapter whose driver settings changed so they apply now. Drops the network for a
@@ -104,7 +107,7 @@ param (
     [switch]$IgnoreLidOnAC = $(if ("$env:IgnoreLidOnAC".Trim()) { "$env:IgnoreLidOnAC".Trim() -eq 'true' } else { $true }),
 
     [Parameter(ParameterSetName = 'Run')]
-    [switch]$AllAdapters = ("$env:AllAdapters".Trim() -eq 'true'),
+    [switch]$ConnectedOnly = ("$env:ConnectedOnly".Trim() -eq 'true'),
 
     [Parameter(ParameterSetName = 'Run')]
     [switch]$RestartAdapter = ("$env:RestartAdapter".Trim() -eq 'true'),
@@ -146,8 +149,8 @@ $PowerSettings = @(
 # display text matches $OffValue, so the driver's own value for "off" is used.
 $PowerSaveKeywords = @('*EEE', 'EEELinkAdvertisement', 'AdvancedEEE', 'EnableGreenEthernet', 'GigaLite', 'PowerSavingMode',
     'ULPMode', 'ReduceSpeedOnPowerDown', 'SipsEnabled', 'AutoPowerSaveModeEnabled', '*SelectiveSuspend', 'MIMOPowerSaveMode',
-    'LinkSpeedBatterySaver', '*DeviceSleepOnDisconnect')
-$PowerSaveName = 'Energy[ -]?Efficient|\bEEE\b|Green|Power ?Sav|Save Power|Power Down|Low Power|\bULP\b|Idle Power|Selective Suspend|Gig(abit|a) ?Lite|Battery Saver|Sleep On Disconnect|SMPS|MIMO Power|U-?APSD|Auto Power|Power Management'
+    'LinkSpeedBatterySaver', '*DeviceSleepOnDisconnect', '*PacketCoalescing')
+$PowerSaveName = 'Energy[ -]?Efficient|\bEEE\b|Green|Power ?Sav|Save Power|Power Down|Low Power|\bULP\b|Idle Power|Selective Suspend|Gig(abit|a) ?Lite|Battery Saver|Sleep On Disconnect|Packet Coalescing|SMPS|MIMO Power|U-?APSD|Auto Power|Power Management'
 $WakeName      = 'Wake|\bWOL\b|\bPME\b|Shutdown'
 $OffValue      = '^(Disabled?|Off)$'
 $PmProperties  = 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'DeviceSleepOnDisconnect'
@@ -188,7 +191,7 @@ function Set-PowerIndex([string]$Scheme, [string]$Sub, [string]$Setting, [Valida
 
 function Get-TargetAdapter {
     @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth' -and ($AllAdapters -or $_.Status -eq 'Up') })
+        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth' -and (-not $ConnectedOnly -or $_.Status -eq 'Up') })
 }
 
 # "Allow the computer to turn off this device to save power" lives in WMI (root\wmi
@@ -204,6 +207,22 @@ function Set-NicTurnOff($Adapter, [bool]$Enable) {
     $i = Get-NicTurnOff $Adapter
     if (-not $i) { throw "$($Adapter.Name): the driver doesn't expose 'Allow the computer to turn off this device'" }
     Set-CimInstance -InputObject $i -Property @{ Enable = $Enable }
+}
+
+# Fallback: the adapter's class key (matched by NetCfgInstanceId). PnPCapabilities 24 (0x18)
+# turns off "Allow the computer to turn off this device"; applies after adapter restart/reboot.
+$NetClassKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+function Get-NicClassKey($Adapter) {
+    $guid = "$($Adapter.InterfaceGuid)"
+    foreach ($k in @(Get-ChildItem -Path $NetClassKey -ErrorAction SilentlyContinue)) {
+        $id = (Get-ItemProperty -Path $k.PSPath -Name NetCfgInstanceId -ErrorAction SilentlyContinue)
+        if ($id -and "$($id.NetCfgInstanceId)" -ieq $guid) { return $k.PSPath }
+    }
+    $null
+}
+function Get-PnpCapability([string]$Key) {
+    $v = Get-ItemProperty -Path $Key -Name PnPCapabilities -ErrorAction SilentlyContinue
+    if ($v) { [int]$v.PnPCapabilities } else { $null }
 }
 
 # Target registry value for a power-saving driver setting, or $null when it has no clear one.
@@ -291,7 +310,7 @@ function Invoke-Apply([bool]$DetectOnly) {
     # --- Network adapters ---------------------------------------------------------------------
     $failed   = 0
     $adapters = @(Get-TargetAdapter)
-    if (-not $adapters.Count) { Write-Log WARN "No $(if ($AllAdapters) { 'physical' } else { 'connected physical' }) network adapters found" }
+    if (-not $adapters.Count) { Write-Log WARN "No $(if ($ConnectedOnly) { 'connected ' } else { '' })physical network adapters found" }
     foreach ($a in $adapters) {
         $guid = "$($a.InterfaceGuid)".ToLower()
         Write-Log -Message "Adapter: $($a.Name) ($($a.InterfaceDescription)) - $($a.Status), driver $($a.DriverVersion)"
@@ -299,11 +318,28 @@ function Invoke-Apply([bool]$DetectOnly) {
         # Power management tab
         $pm = Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue
         foreach ($p in $PmProperties) {
+            $route = $null
             if ($p -eq 'AllowComputerToTurnOffDevice') {
                 $wmi = Get-NicTurnOff $a
-                if (-not $wmi) { Write-Log -Message "  Allow the computer to turn off this device: not offered by this driver"; continue }
-                Write-Log -Message "  Allow the computer to turn off this device: $(if ($wmi.Enable) { 'On' } else { 'Off' })"
-                if (-not $wmi.Enable) { continue }
+                $pmOn = $pm -and ($pm.PSObject.Properties.Name -contains $p) -and "$($pm.$p)" -eq 'Enabled'
+                if ($wmi) {
+                    Write-Log -Message "  Allow the computer to turn off this device: $(if ($wmi.Enable) { 'On' } else { 'Off' }) (WMI)"
+                    if (-not $wmi.Enable) { continue }
+                    $route = 'Wmi'
+                }
+                elseif ($pmOn) {
+                    $classKey = Get-NicClassKey $a
+                    if (-not $classKey) { Write-Log WARN "  Allow the computer to turn off this device: On, but the adapter's registry key wasn't found"; $failed++; continue }
+                    $capNow = Get-PnpCapability $classKey
+                    if ($capNow -eq 24) { Write-Log -Message '  Allow the computer to turn off this device: set to Off, applies after adapter restart or reboot'; continue }
+                    Write-Log -Message "  Allow the computer to turn off this device: On (PnPCapabilities $(if ($null -eq $capNow) { 'not set' } else { $capNow }))"
+                    $route = 'Pnp'
+                }
+                else {
+                    $state0 = if ($pm -and ($pm.PSObject.Properties.Name -contains $p)) { "$($pm.$p)" } else { 'not offered' }
+                    Write-Log -Message "  Allow the computer to turn off this device: $state0"
+                    continue
+                }
             }
             else {
                 if (-not $pm -or -not ($pm.PSObject.Properties.Name -contains $p) -or "$($pm.$p)" -ne 'Enabled') { continue }
@@ -312,17 +348,25 @@ function Invoke-Apply([bool]$DetectOnly) {
             $pending++
             if ($DetectOnly) { continue }
             try {
-                Add-StateEntry $state @{ Key = "PM|$guid|$p"; Type = 'NicPm'; Adapter = $guid; AdapterName = $a.Name; Property = $p; Value = 'Enabled' }
-                Save-State $state
-                if ($p -eq 'AllowComputerToTurnOffDevice') { Set-NicTurnOff $a $false }
-                else { $one = @{ $p = 'Disabled' }; Set-NetAdapterPowerManagement -Name $a.Name @one -NoRestart }
+                if ($route -eq 'Pnp') {
+                    Add-StateEntry $state @{ Key = "PNP|$guid"; Type = 'NicPnp'; Adapter = $guid; AdapterName = $a.Name; Value = $(if ($null -eq $capNow) { '<none>' } else { "$capNow" }) }
+                    Save-State $state
+                    New-ItemProperty -Path $classKey -Name PnPCapabilities -Value 24 -PropertyType DWord -Force | Out-Null
+                }
+                else {
+                    Add-StateEntry $state @{ Key = "PM|$guid|$p"; Type = 'NicPm'; Adapter = $guid; AdapterName = $a.Name; Property = $p; Value = 'Enabled' }
+                    Save-State $state
+                    if ($route -eq 'Wmi') { Set-NicTurnOff $a $false }
+                    else { $one = @{ $p = 'Disabled' }; Set-NetAdapterPowerManagement -Name $a.Name @one -NoRestart }
+                }
                 $changed++; $nicChanged[$a.Name] = $true
             }
             catch { $failed++; Write-Log ERROR "  $p could not be changed: $($_.Exception.Message)" }
         }
 
         # Advanced (driver) settings: list all, change the power-saving ones
-        $props = @(Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue | Sort-Object DisplayName)
+        $props = @(Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue |
+            Where-Object { "$($_.DisplayName)" -or $PowerSaveKeywords -contains "$($_.RegistryKeyword)" } | Sort-Object DisplayName)
         Write-Log -Message "  Driver settings ($($props.Count)):"
         foreach ($prop in $props) {
             $name = "$($prop.DisplayName)"; $kw = "$($prop.RegistryKeyword)"
@@ -395,10 +439,23 @@ function Invoke-Restore {
                 'NicPm' {
                     $a = $adapters[$e.Adapter]
                     if (-not $a) { Write-Log WARN "Adapter $($e.AdapterName) not found; $($e.Property) not restored"; continue }
-                    if ($e.Property -eq 'AllowComputerToTurnOffDevice') { Set-NicTurnOff $a ($e.Value -eq 'Enabled') }
+                    if ($e.Property -eq 'AllowComputerToTurnOffDevice') {
+                        if (Get-NicTurnOff $a) { Set-NicTurnOff $a ($e.Value -eq 'Enabled') }
+                        else { Write-Log -Message "$($a.Name) AllowComputerToTurnOffDevice: handled through PnPCapabilities"; continue }
+                    }
                     else { $p = @{ $e.Property = $e.Value }; Set-NetAdapterPowerManagement -Name $a.Name @p -NoRestart }
                     $nic = $true
                     Write-Log CHANGE "$($a.Name) $($e.Property): restored to $($e.Value)"
+                }
+                'NicPnp' {
+                    $a = $adapters[$e.Adapter]
+                    if (-not $a) { Write-Log WARN "Adapter $($e.AdapterName) not found; PnPCapabilities not restored"; continue }
+                    $k = Get-NicClassKey $a
+                    if (-not $k) { throw "registry key for $($a.Name) not found" }
+                    if ($e.Value -eq '<none>') { Remove-ItemProperty -Path $k -Name PnPCapabilities -ErrorAction SilentlyContinue }
+                    else { New-ItemProperty -Path $k -Name PnPCapabilities -Value ([int]$e.Value) -PropertyType DWord -Force | Out-Null }
+                    $nic = $true
+                    Write-Log CHANGE "$($a.Name) PnPCapabilities: restored to $($e.Value)"
                 }
                 'NicAdv' {
                     $a = $adapters[$e.Adapter]
@@ -423,7 +480,7 @@ function Invoke-Restore {
 try {
     Write-Log -Message "Set-RemoteAccessPowerSetting $ComponentVersion on $env:COMPUTERNAME"
     if ($Mode -notin 'Apply', 'Restore', 'DetectOnly') { throw "Mode must be Apply, Restore or DetectOnly (got '$Mode')" }
-    Write-Log -Message "Mode: $Mode | IncludeBattery: $IncludeBattery | IgnoreLidOnAC: $IgnoreLidOnAC | RestartAdapter: $RestartAdapter"
+    Write-Log -Message "Mode: $Mode | IncludeBattery: $IncludeBattery | IgnoreLidOnAC: $IgnoreLidOnAC | ConnectedOnly: $ConnectedOnly | RestartAdapter: $RestartAdapter"
 
     switch ($Mode) {
         'Apply'      { Invoke-Apply -DetectOnly $false }
