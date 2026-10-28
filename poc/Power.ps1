@@ -149,7 +149,7 @@ $PowerSettings = @(
 # display text matches $OffValue, so the driver's own value for "off" is used.
 $PowerSaveKeywords = @('*EEE', 'EEELinkAdvertisement', 'AdvancedEEE', 'EnableGreenEthernet', 'GigaLite', 'PowerSavingMode',
     'ULPMode', 'ReduceSpeedOnPowerDown', 'SipsEnabled', 'AutoPowerSaveModeEnabled', '*SelectiveSuspend', 'MIMOPowerSaveMode',
-    'LinkSpeedBatterySaver', '*DeviceSleepOnDisconnect', '*PacketCoalescing')
+    'LinkSpeedBatterySaver', '*DeviceSleepOnDisconnect', '*PacketCoalescing', '*IdleRestriction')
 $PowerSaveName = 'Energy[ -]?Efficient|\bEEE\b|Green|Power ?Sav|Save Power|Power Down|Low Power|\bULP\b|Idle Power|Selective Suspend|Gig(abit|a) ?Lite|Battery Saver|Sleep On Disconnect|Packet Coalescing|SMPS|MIMO Power|U-?APSD|Auto Power|Power Management'
 $WakeName      = 'Wake|\bWOL\b|\bPME\b|Shutdown'
 $OffValue      = '^(Disabled?|Off)$'
@@ -240,7 +240,12 @@ function Get-PnpCapability([string]$Key) {
 function Get-AdvancedTarget($Prop) {
     $display = @($Prop.ValidDisplayValues); $values = @($Prop.ValidRegistryValues)
     if (-not $display.Count -or $display.Count -ne $values.Count) { return $null }
-    $pattern = if ("$($Prop.DisplayName)" -match 'MIMO|SMPS') { 'No SMPS' } elseif ("$($Prop.DisplayName)" -match 'Transmit Power') { 'Highest|^100' } else { $OffValue }
+    # *IdleRestriction ("Idle power down restriction"): Enabled = the NIC may power down only when
+    # the PC sleeps, not while it's on and idle. It's the one power setting where On is the goal.
+    $pattern = if ("$($Prop.RegistryKeyword)" -eq '*IdleRestriction' -or "$($Prop.DisplayName)" -match 'Idle power down restriction') { '^(Enabled|On)$' }
+               elseif ("$($Prop.DisplayName)" -match 'MIMO|SMPS') { 'No SMPS' }
+               elseif ("$($Prop.DisplayName)" -match 'Transmit Power') { 'Highest|^100' }
+               else { $OffValue }
     $i = 0..($display.Count - 1) | Where-Object { $display[$_] -match $pattern } | Select-Object -First 1
     if ($null -eq $i) { return $null }
     [pscustomobject]@{ Value = "$($values[$i])"; Display = "$($display[$i])" }
@@ -354,6 +359,13 @@ function Invoke-Apply([bool]$DetectOnly) {
             }
             else {
                 if (-not $pm -or -not ($pm.PSObject.Properties.Name -contains $p) -or "$($pm.$p)" -ne 'Enabled') { continue }
+                # Some drivers (e.g. Intel I219) report SelectiveSuspend but have no *SelectiveSuspend
+                # setting: Set-NetAdapterPowerManagement then changes nothing. Their idle power-down
+                # is the "Idle power down restriction" driver setting, handled below.
+                if ($p -eq 'SelectiveSuspend' -and -not (Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -RegistryKeyword '*SelectiveSuspend' -ErrorAction SilentlyContinue)) {
+                    Write-Log -Message "  SelectiveSuspend: Enabled, but this driver has no selective suspend setting (idle power-down is 'Idle power down restriction' if offered)"
+                    continue
+                }
                 # Written earlier with -NoRestart: the driver reports the old value until it restarts.
                 if (Test-PmPending $a $p) { Write-Log -Message "  $p`: set to Disabled, applies after adapter restart or reboot"; continue }
             }
