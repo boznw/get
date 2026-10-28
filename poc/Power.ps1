@@ -16,13 +16,18 @@
         - Networking connectivity in standby   -> Enabled    (Modern Standby PCs only)
         - Lid close action (plugged in only)   -> Do nothing (IgnoreLidOnAC)
 
-      Network adapters (physical, not Bluetooth)
-        - "Allow the computer to turn off this device to save power" -> off
-        - Selective suspend / sleep on disconnect (power management)  -> off
-        - Driver power-saving options: Energy Efficient Ethernet, Advanced EEE, Green Ethernet,
-          Gigabit Lite, Power Saving Mode, Ultra Low Power Mode, Reduce Speed On Power Down,
-          System Idle Power Saver, Auto Power Save, Selective Suspend -> Disabled / Off;
-          Wi-Fi MIMO Power Save Mode -> No SMPS
+      Network adapters (physical, not Bluetooth; connected ones only unless AllAdapters)
+        - Every driver (advanced) setting is listed with its value and options, so the job
+          output shows what the driver offers.
+        - Every power-saving driver setting is set to its Off/Disabled value: found by keyword
+          (*EEE, AdvancedEEE, EnableGreenEthernet, GigaLite, PowerSavingMode, ULPMode, ...) or by
+          name (Energy Efficient, EEE, Green, Power Saving, Low Power, Power Down, Idle Power,
+          Selective Suspend, Gigabit Lite, Battery Saver, U-APSD, ...). Wake-on-LAN / PME settings
+          are never touched. Wi-Fi MIMO Power Save Mode -> No SMPS; Transmit Power -> Highest.
+        - "Allow the computer to turn off this device to save power" -> off (set through
+          WMI root\wmi MSPower_DeviceEnable; Set-NetAdapterPowerManagement can't set it)
+        - Selective suspend / sleep on disconnect (power management tab) -> off
+        Each change is made on its own: one the driver refuses is logged and the rest still apply.
 
     The display is still allowed to turn off: that doesn't drop a remote session.
 
@@ -51,6 +56,10 @@
     Closing the lid while plugged in does nothing instead of sleeping. Default on.
     Component variable: IgnoreLidOnAC ("true"/"false").
 
+.PARAMETER AllAdapters
+    Also change physical adapters that aren't connected now (e.g. the dock's Ethernet).
+    Default off: connected adapters only. Component variable: AllAdapters ("true"/"false").
+
 .PARAMETER RestartAdapter
     Restart each adapter whose driver settings changed so they apply now. Drops the network for a
     few seconds. Default off. Component variable: RestartAdapter ("true"/"false").
@@ -63,7 +72,7 @@
     Author:          Stephen Bozarth
     Created:         2026-10-28
     Modified:        2026-10-28
-    Version:         1.0.0
+    Version:         1.1.0
     Ticket:          no-ticket
     Permissions:     Local System (Datto RMM agent)
     Unattended-safe: Yes (no adapter bounce unless RestartAdapter = true)
@@ -95,6 +104,9 @@ param (
     [switch]$IgnoreLidOnAC = $(if ("$env:IgnoreLidOnAC".Trim()) { "$env:IgnoreLidOnAC".Trim() -eq 'true' } else { $true }),
 
     [Parameter(ParameterSetName = 'Run')]
+    [switch]$AllAdapters = ("$env:AllAdapters".Trim() -eq 'true'),
+
+    [Parameter(ParameterSetName = 'Run')]
     [switch]$RestartAdapter = ("$env:RestartAdapter".Trim() -eq 'true'),
 
     # Usage: -Help, -Usage, --help, --usage or -? (repo rule, naming conventions §9)
@@ -113,7 +125,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'   # no progress bars in a component (§9)
 
-$ComponentVersion = '1.0.0'
+$ComponentVersion = '1.1.0'
 $StateKey         = 'HKLM:\SOFTWARE\BozNW\RemoteAccessPowerSetting'
 $PolicyKey        = 'HKLM:\SOFTWARE\Policies\Microsoft\Power\PowerSettings'
 
@@ -129,23 +141,16 @@ $PowerSettings = @(
     @{ Name = 'Lid close action';                   Sub = '4f971e89-eebd-4455-a8de-9e59040e7347'; Setting = '5ca83367-6e45-459f-a27b-476b1d01c936'; Ac = 0; Dc = $null; Lid = $true }
 )
 
-# Adapter driver (advanced) properties to turn off, by registry keyword. Target is the valid value
-# whose display text matches the pattern, so the driver's own value for "off" is used.
-$AdvancedKeywords = [ordered]@{
-    '*EEE'                     = '^(Disabled|Off)$'
-    'EEELinkAdvertisement'     = '^(Disabled|Off)$'
-    'AdvancedEEE'              = '^(Disabled|Off)$'
-    'EnableGreenEthernet'      = '^(Disabled|Off)$'
-    'GigaLite'                 = '^(Disabled|Off)$'
-    'PowerSavingMode'          = '^(Disabled|Off)$'
-    'ULPMode'                  = '^(Disabled|Off)$'
-    'ReduceSpeedOnPowerDown'   = '^(Disabled|Off)$'
-    'SipsEnabled'              = '^(Disabled|Off)$'
-    'AutoPowerSaveModeEnabled' = '^(Disabled|Off)$'
-    '*SelectiveSuspend'        = '^(Disabled|Off)$'
-    'MIMOPowerSaveMode'        = 'No SMPS'
-}
-$PmProperties = 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'DeviceSleepOnDisconnect'
+# Adapter driver (advanced) settings. A setting is power-saving when its keyword is listed here
+# or its display name matches $PowerSaveName (and not $WakeName). Target: the valid value whose
+# display text matches $OffValue, so the driver's own value for "off" is used.
+$PowerSaveKeywords = @('*EEE', 'EEELinkAdvertisement', 'AdvancedEEE', 'EnableGreenEthernet', 'GigaLite', 'PowerSavingMode',
+    'ULPMode', 'ReduceSpeedOnPowerDown', 'SipsEnabled', 'AutoPowerSaveModeEnabled', '*SelectiveSuspend', 'MIMOPowerSaveMode',
+    'LinkSpeedBatterySaver', '*DeviceSleepOnDisconnect')
+$PowerSaveName = 'Energy[ -]?Efficient|\bEEE\b|Green|Power ?Sav|Save Power|Power Down|Low Power|\bULP\b|Idle Power|Selective Suspend|Gig(abit|a) ?Lite|Battery Saver|Sleep On Disconnect|SMPS|MIMO Power|U-?APSD|Auto Power|Power Management'
+$WakeName      = 'Wake|\bWOL\b|\bPME\b|Shutdown'
+$OffValue      = '^(Disabled?|Off)$'
+$PmProperties  = 'AllowComputerToTurnOffDevice', 'SelectiveSuspend', 'DeviceSleepOnDisconnect'
 
 $script:ExitCode = 1
 $script:Result   = 'FAILURE Stopped before completing'
@@ -183,7 +188,32 @@ function Set-PowerIndex([string]$Scheme, [string]$Sub, [string]$Setting, [Valida
 
 function Get-TargetAdapter {
     @(Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
-        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth' })
+        Where-Object { $_.InterfaceDescription -notmatch 'Bluetooth' -and ($AllAdapters -or $_.Status -eq 'Up') })
+}
+
+# "Allow the computer to turn off this device to save power" lives in WMI (root\wmi
+# MSPower_DeviceEnable, InstanceName = <PnP device ID>_<n>). Returns the instance or $null.
+function Get-NicTurnOff($Adapter) {
+    $pnp = "$($Adapter.PnPDeviceID)"
+    if (-not $pnp) { return $null }
+    Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction SilentlyContinue |
+        Where-Object { "$($_.InstanceName)".StartsWith($pnp, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+}
+
+function Set-NicTurnOff($Adapter, [bool]$Enable) {
+    $i = Get-NicTurnOff $Adapter
+    if (-not $i) { throw "$($Adapter.Name): the driver doesn't expose 'Allow the computer to turn off this device'" }
+    Set-CimInstance -InputObject $i -Property @{ Enable = $Enable }
+}
+
+# Target registry value for a power-saving driver setting, or $null when it has no clear one.
+function Get-AdvancedTarget($Prop) {
+    $display = @($Prop.ValidDisplayValues); $values = @($Prop.ValidRegistryValues)
+    if (-not $display.Count -or $display.Count -ne $values.Count) { return $null }
+    $pattern = if ("$($Prop.DisplayName)" -match 'MIMO|SMPS') { 'No SMPS' } elseif ("$($Prop.DisplayName)" -match 'Transmit Power') { 'Highest|^100' } else { $OffValue }
+    $i = 0..($display.Count - 1) | Where-Object { $display[$_] -match $pattern } | Select-Object -First 1
+    if ($null -eq $i) { return $null }
+    [pscustomobject]@{ Value = "$($values[$i])"; Display = "$($display[$i])" }
 }
 
 function Read-State {
@@ -259,50 +289,63 @@ function Invoke-Apply([bool]$DetectOnly) {
     }
 
     # --- Network adapters ---------------------------------------------------------------------
+    $failed   = 0
     $adapters = Get-TargetAdapter
-    if (-not $adapters.Count) { Write-Log WARN 'No physical network adapters found' }
+    if (-not $adapters.Count) { Write-Log WARN "No $(if ($AllAdapters) { 'physical' } else { 'connected physical' }) network adapters found" }
     foreach ($a in $adapters) {
         $guid = "$($a.InterfaceGuid)".ToLower()
-        Write-Log -Message "Adapter: $($a.Name) ($($a.InterfaceDescription)) - $($a.Status)"
+        Write-Log -Message "Adapter: $($a.Name) ($($a.InterfaceDescription)) - $($a.Status), driver $($a.DriverVersion)"
 
         # Power management tab
         $pm = Get-NetAdapterPowerManagement -Name $a.Name -ErrorAction SilentlyContinue
-        if ($pm) {
-            $set = @{}
-            foreach ($p in $PmProperties) {
-                if (-not ($pm.PSObject.Properties.Name -contains $p)) { continue }
-                if ("$($pm.$p)" -ne 'Enabled') { continue }
-                Write-Log $verbLevel "  $p`: Enabled -> Disabled"
-                $pending++
-                if ($DetectOnly) { continue }
-                Add-StateEntry $state @{ Key = "PM|$guid|$p"; Type = 'NicPm'; Adapter = $guid; AdapterName = $a.Name; Property = $p; Value = 'Enabled' }
-                $set[$p] = 'Disabled'
+        foreach ($p in $PmProperties) {
+            if ($p -eq 'AllowComputerToTurnOffDevice') {
+                $wmi = Get-NicTurnOff $a
+                if (-not $wmi) { Write-Log -Message "  Allow the computer to turn off this device: not offered by this driver"; continue }
+                Write-Log -Message "  Allow the computer to turn off this device: $(if ($wmi.Enable) { 'On' } else { 'Off' })"
+                if (-not $wmi.Enable) { continue }
             }
-            if ($set.Count) {
-                Save-State $state
-                Set-NetAdapterPowerManagement -Name $a.Name @set -NoRestart
-                $changed += $set.Count; $nicChanged[$a.Name] = $true
+            else {
+                if (-not $pm -or -not ($pm.PSObject.Properties.Name -contains $p) -or "$($pm.$p)" -ne 'Enabled') { continue }
             }
-        }
-
-        # Advanced (driver) properties
-        $props = @(Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue |
-            Where-Object { $AdvancedKeywords.Contains($_.RegistryKeyword) })
-        foreach ($prop in $props) {
-            $kw = $prop.RegistryKeyword
-            $display = @($prop.ValidDisplayValues); $values = @($prop.ValidRegistryValues)
-            if (-not $display.Count -or $display.Count -ne $values.Count) { continue }
-            $i = 0..($display.Count - 1) | Where-Object { $display[$_] -match $AdvancedKeywords[$kw] } | Select-Object -First 1
-            if ($null -eq $i) { continue }
-            $want = "$($values[$i])"; $cur = "$(@($prop.RegistryValue)[0])"
-            if ($cur -eq $want) { continue }
-            Write-Log $verbLevel "  $($prop.DisplayName): $($prop.DisplayValue) -> $($display[$i])"
+            Write-Log $verbLevel "  $p`: Enabled -> Disabled"
             $pending++
             if ($DetectOnly) { continue }
-            Add-StateEntry $state @{ Key = "ADV|$guid|$kw"; Type = 'NicAdv'; Adapter = $guid; AdapterName = $a.Name; Keyword = $kw; Value = $cur }
-            Save-State $state
-            Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword $kw -RegistryValue $want -AllProperties -NoRestart
-            $changed++; $nicChanged[$a.Name] = $true
+            try {
+                Add-StateEntry $state @{ Key = "PM|$guid|$p"; Type = 'NicPm'; Adapter = $guid; AdapterName = $a.Name; Property = $p; Value = 'Enabled' }
+                Save-State $state
+                if ($p -eq 'AllowComputerToTurnOffDevice') { Set-NicTurnOff $a $false }
+                else { $one = @{ $p = 'Disabled' }; Set-NetAdapterPowerManagement -Name $a.Name @one -NoRestart }
+                $changed++; $nicChanged[$a.Name] = $true
+            }
+            catch { $failed++; Write-Log ERROR "  $p could not be changed: $($_.Exception.Message)" }
+        }
+
+        # Advanced (driver) settings: list all, change the power-saving ones
+        $props = @(Get-NetAdapterAdvancedProperty -Name $a.Name -AllProperties -ErrorAction SilentlyContinue | Sort-Object DisplayName)
+        Write-Log -Message "  Driver settings ($($props.Count)):"
+        foreach ($prop in $props) {
+            $name = "$($prop.DisplayName)"; $kw = "$($prop.RegistryKeyword)"
+            $opts = @($prop.ValidDisplayValues) -join ' | '
+            $shown = if ($name) { $name } else { $kw }
+            Write-Log -Message ("    {0} [{1}] = {2}{3}" -f $shown, $kw, $prop.DisplayValue, $(if ($opts) { "  (options: $opts)" } else { '' }))
+
+            $byName  = ($name -match $PowerSaveName -or $name -match 'Transmit Power') -and $name -notmatch $WakeName
+            if (-not ($PowerSaveKeywords -contains $kw -or $byName)) { continue }
+            $t = Get-AdvancedTarget $prop
+            if (-not $t) { Write-Log -Message "      power-related, no Off/Highest value offered: left as is"; continue }
+            $cur = "$(@($prop.RegistryValue)[0])"
+            if ($cur -eq $t.Value) { continue }
+            Write-Log $verbLevel "      $shown`: $($prop.DisplayValue) -> $($t.Display)"
+            $pending++
+            if ($DetectOnly) { continue }
+            try {
+                Add-StateEntry $state @{ Key = "ADV|$guid|$kw"; Type = 'NicAdv'; Adapter = $guid; AdapterName = $a.Name; Keyword = $kw; Value = $cur }
+                Save-State $state
+                Set-NetAdapterAdvancedProperty -Name $a.Name -RegistryKeyword $kw -RegistryValue $t.Value -AllProperties -NoRestart
+                $changed++; $nicChanged[$a.Name] = $true
+            }
+            catch { $failed++; Write-Log ERROR "      $shown could not be changed: $($_.Exception.Message)" }
         }
     }
 
@@ -312,6 +355,7 @@ function Invoke-Apply([bool]$DetectOnly) {
         else          { $script:ExitCode = 0; $script:Result = 'SUCCESS Compliant: nothing to change' }
         return
     }
+    if ($failed) { $script:ExitCode = 1; $script:Result = "FAILURE $failed setting(s) could not be changed; $changed changed"; return }
     if (-not $changed) { $script:ExitCode = 0; $script:Result = 'SUCCESS Already set: nothing to change'; return }
 
     $tail = ''
@@ -351,8 +395,9 @@ function Invoke-Restore {
                 'NicPm' {
                     $a = $adapters[$e.Adapter]
                     if (-not $a) { Write-Log WARN "Adapter $($e.AdapterName) not found; $($e.Property) not restored"; continue }
-                    $p = @{ $e.Property = $e.Value }
-                    Set-NetAdapterPowerManagement -Name $a.Name @p -NoRestart; $nic = $true
+                    if ($e.Property -eq 'AllowComputerToTurnOffDevice') { Set-NicTurnOff $a ($e.Value -eq 'Enabled') }
+                    else { $p = @{ $e.Property = $e.Value }; Set-NetAdapterPowerManagement -Name $a.Name @p -NoRestart }
+                    $nic = $true
                     Write-Log CHANGE "$($a.Name) $($e.Property): restored to $($e.Value)"
                 }
                 'NicAdv' {
