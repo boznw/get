@@ -18,8 +18,10 @@
          Apply on an account this script created resets its password and expiry. An account of
          that name that this script didn't create is never touched (the run fails).
       3. Password: Password if given, otherwise <PasswordPrefix><yy><day of year><PasswordSuffix>
-         from this PC's date (run on 1 Jan 2027 -> <prefix>27001<suffix>). The password itself is
-         never written to the job output, only the date part.
+         from this PC's date. Defaults Mig and !: run on 1 Jan 2027 -> Mig27001!. If the PC's
+         password policy needs more (minimum length, complexity), the rule is extended and the
+         job output says how (see "Password policy" in the README). The job output shows only
+         the pattern with the prefix and suffix masked, e.g. <prefix>27001<suffix>.
       4. Share: C:\Users (the profiles folder) as Users$: Administrators Full, Authenticated
          Users Read. NTFS is not changed; the account sees everything as a local administrator.
       5. Remote admin: LocalAccountTokenFilterPolicy = 1, so a local administrator keeps admin
@@ -115,9 +117,9 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'   # no progress bars in a component (§9)
 
 # ======================= Defaults (edit here) =======================================
-# Password rule: <prefix><yy><day of year, 3 digits><suffix>. Replace both placeholders.
-$DefaultPasswordPrefix = '<PREFIX>'
-$DefaultPasswordSuffix = '<SUFFIX>'
+# Password rule: <prefix><yy><day of year, 3 digits><suffix>, e.g. 1 Jan 2027 -> Mig27001!
+$DefaultPasswordPrefix = 'Mig'
+$DefaultPasswordSuffix = '!'
 # =====================================================================================
 
 $RecordKey   = 'HKLM:\SOFTWARE\BozNW\UserMigrationShare'
@@ -131,6 +133,45 @@ $AdminsSid   = 'S-1-5-32-544'
 $AuthUsersSid = 'S-1-5-11'
 
 function Write-Log { param([string]$Level, [string]$Message) Write-Output "[$Level] $Message" }
+
+# Local password policy: @{ MinLength; Complexity } from secedit (language independent).
+function Get-PasswordPolicy {
+    $cfg = Join-Path $env:TEMP ("secpol-{0}.inf" -f [guid]::NewGuid().ToString('N'))
+    $pol = @{ MinLength = 0; Complexity = $false }
+    try {
+        & secedit.exe /export /cfg $cfg /areas SECURITYPOLICY /quiet | Out-Null
+        foreach ($line in (Get-Content $cfg -ErrorAction Stop)) {
+            if ($line -match '^\s*MinimumPasswordLength\s*=\s*(\d+)') { $pol.MinLength = [int]$Matches[1] }
+            if ($line -match '^\s*PasswordComplexity\s*=\s*(\d+)')    { $pol.Complexity = $Matches[1] -eq '1' }
+        }
+    }
+    catch { Write-Log WARN "Could not read the password policy ($($_.Exception.Message)); assuming none" }
+    finally { Remove-Item $cfg -Force -ErrorAction SilentlyContinue }
+    $pol
+}
+
+# Extends <prefix><date><suffix> until it meets the policy. Returns @{ Password; Pattern; Notes }.
+function Resolve-RulePassword([string]$Prefix, [string]$DatePart, [string]$Suffix, [string]$Year, [hashtable]$Policy, [string]$Account) {
+    $mid = $DatePart; $notes = @()
+    $build = { "$Prefix$mid$Suffix" }
+    while ((& $build).Length -lt $Policy.MinLength) { $mid += $Year }
+    if ($mid -ne $DatePart) {
+        $notes += "minimum length $($Policy.MinLength): year $Year appended to the date part ($(($mid.Length - $DatePart.Length) / 4)x)"
+    }
+    if ($Policy.Complexity) {
+        $pw = & $build
+        $classes = @(($pw -cmatch '[A-Z]'), ($pw -cmatch '[a-z]'), ($pw -match '\d'), ($pw -match '[^A-Za-z0-9]')) | Where-Object { $_ }
+        $extra = ''
+        foreach ($c in @(@('[A-Z]', 'A'), @('[a-z]', 'a'), @('[^A-Za-z0-9]', '!'))) {
+            if (@($classes).Count + $extra.Length -ge 3) { break }
+            if ($pw -cnotmatch $c[0]) { $extra += $c[1] }
+        }
+        if ($extra) { $notes += "complexity: '$extra' added after the suffix" }
+        if ($Account -and ($pw + $extra) -match [regex]::Escape($Account)) { throw "the password would contain the account name '$Account' (complexity rule); change AccountName or the prefix" }
+        return @{ Password = (& $build) + $extra; Pattern = "<prefix>$mid<suffix>$extra"; Notes = $notes }
+    }
+    @{ Password = (& $build); Pattern = "<prefix>$mid<suffix>"; Notes = $notes }
+}
 function Get-SidName([string]$Sid) { (New-Object Security.Principal.SecurityIdentifier $Sid).Translate([Security.Principal.NTAccount]).Value }
 function Get-Record { if (Test-Path $RecordKey) { Get-ItemProperty $RecordKey } else { $null } }
 function Save-Record([hashtable]$Values) {
@@ -196,12 +237,16 @@ try {
     $now     = Get-Date
     $expires = $now.Date.AddDays($days + 1).AddMinutes(-1)          # end of the last day
     $datePart = '{0:yy}{1:000}' -f $now, $now.DayOfYear
+    $policy = Get-PasswordPolicy
+    Write-Log INFO "Password policy: minimum length $($policy.MinLength), complexity $(if ($policy.Complexity) { 'on' } else { 'off' })"
     if ($Password) { $pw = $Password; $pwNote = 'from the Password variable' }
     else {
         $pre = if ("$PasswordPrefix".Trim()) { $PasswordPrefix } else { $DefaultPasswordPrefix }
         $suf = if ("$PasswordSuffix".Trim()) { $PasswordSuffix } else { $DefaultPasswordSuffix }
-        if ($pre -match '^<.*>$' -or $suf -match '^<.*>$') { throw 'Password prefix/suffix not set: fill in $DefaultPasswordPrefix and $DefaultPasswordSuffix in the script, or set PasswordPrefix and PasswordSuffix' }
-        $pw = "$pre$datePart$suf"; $pwNote = "<prefix>$datePart<suffix>"
+        $res = Resolve-RulePassword $pre $datePart $suf ('{0:yyyy}' -f $now) $policy $AccountName
+        $pw = $res.Password
+        $pwNote = $res.Pattern   # prefix and suffix masked: the job output never shows the password
+        foreach ($n in $res.Notes) { Write-Log WARN "Password adjusted for the PC's policy: $n -> $pwNote" }
     }
     $profilesDir = [Environment]::ExpandEnvironmentVariables((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList').ProfilesDirectory)
 
@@ -224,7 +269,7 @@ try {
     $user = Get-LocalUser -Name $AccountName -ErrorAction SilentlyContinue
     if ($user -and "$($r.CreatedAccount)" -ne '1') { throw "a local account named $AccountName already exists and wasn't created by this component; set AccountName to another name" }
     $secure = ConvertTo-SecureString $pw -AsPlainText -Force
-    $desc = "Temporary data migration account, expires $($expires.ToString('yyyy-MM-dd')) (BozNW)"
+    $desc = "BozNW data migration, expires $($expires.ToString('yyyy-MM-dd'))"   # max 48 chars
     if (-not $user) {
         Write-Log INFO "${Would}create local administrator $AccountName (expires $($expires.ToString('yyyy-MM-dd HH:mm')))"
         if (-not $DryRun) {
