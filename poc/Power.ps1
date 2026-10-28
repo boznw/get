@@ -220,6 +220,17 @@ function Get-NicClassKey($Adapter) {
     }
     $null
 }
+# True when the driver's registry already holds the Disabled value for a power-management
+# property (Set-NetAdapterPowerManagement -NoRestart wrote it) but the adapter hasn't restarted.
+function Test-PmPending($Adapter, [string]$Property) {
+    $kw = @{ SelectiveSuspend = '*SelectiveSuspend'; DeviceSleepOnDisconnect = '*DeviceSleepOnDisconnect' }[$Property]
+    if (-not $kw) { return $false }
+    $key = Get-NicClassKey $Adapter
+    if (-not $key) { return $false }
+    $v = Get-ItemProperty -Path $key -Name $kw -ErrorAction SilentlyContinue
+    $v -and "$($v.$kw)" -eq '0'
+}
+
 function Get-PnpCapability([string]$Key) {
     $v = Get-ItemProperty -Path $Key -Name PnPCapabilities -ErrorAction SilentlyContinue
     if ($v) { [int]$v.PnPCapabilities } else { $null }
@@ -343,6 +354,8 @@ function Invoke-Apply([bool]$DetectOnly) {
             }
             else {
                 if (-not $pm -or -not ($pm.PSObject.Properties.Name -contains $p) -or "$($pm.$p)" -ne 'Enabled') { continue }
+                # Written earlier with -NoRestart: the driver reports the old value until it restarts.
+                if (Test-PmPending $a $p) { Write-Log -Message "  $p`: set to Disabled, applies after adapter restart or reboot"; continue }
             }
             Write-Log $verbLevel "  $p`: Enabled -> Disabled"
             $pending++
